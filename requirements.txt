@@ -9,3 +9,5 @@ nltk
 numpy
 torch
 torchvision
+huggingface_hub
+tokenizers

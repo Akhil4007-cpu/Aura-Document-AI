@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+.vscode/
+.idea/
+*.extracted.txt
+verify_*.py
+test_*.py
+faiss_index/
+nltk_data/
+huggingface_hub/

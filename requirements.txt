@@ -8,3 +8,4 @@ python-docx
 nltk
 numpy
 torch
+torchvision

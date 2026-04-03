@@ -5,6 +5,7 @@ from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
+from threading import Thread
 
 import faiss
 import numpy as np
@@ -13,7 +14,7 @@ import streamlit as st
 import nltk
 import docx
 from pypdf import PdfReader
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 APP_DIR = Path(__file__).resolve().parent
@@ -149,20 +150,27 @@ def extract_keywords(query: str) -> List[str]:
     stopwords = {"what", "who", "is", "of", "the", "in", "and", "a", "an", "to", "for", "with", "his", "her", "their", "are", "by", "from", "at"}
     return [w for w in re.findall(r"\w+", query.lower()) if w not in stopwords and len(w) > 2]
 
-def synthesize_answer(results: List[Dict[str, Any]], query: str, reasoning_module: Optional[Tuple[Any, Any]] = None, max_sentences: int = 4) -> Tuple[str, List[int]]:
-    if not results: return "Information not found in context.", []
+def synthesize_answer(results: List[Dict[str, Any]], query: str, reasoning_module: Optional[Tuple[Any, Any]] = None):
+    if not results:
+        yield "Information not found in context."
+        return
+    
     top_context, used_indices = [], []
     seen_text = set()
     for i, r in enumerate(results[:6]):
         text = r.get("text", "").strip()
-        # Deduplication check
-        text_hash = text[:100] # Use prefix as a simple hash
+        text_hash = text[:100]
         if len(text) > 30 and text_hash not in seen_text:
             top_context.append(f"[Source {i+1}]: {text}")
             used_indices.append(i)
             seen_text.add(text_hash)
-    if not top_context: return "Information not found in context.", []
+            
+    if not top_context:
+        yield "Information not found in context."
+        return
+
     context_str = "\n\n".join(top_context)
+    
     if reasoning_module:
         tokenizer, model = reasoning_module
         system_msg = (
@@ -175,20 +183,26 @@ def synthesize_answer(results: List[Dict[str, Any]], query: str, reasoning_modul
         ]
         input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(
-                inputs["input_ids"], 
-                max_new_tokens=350, 
-                temperature=0.3, 
-                repetition_penalty=1.15,
-                no_repeat_ngram_size=3,
-                do_sample=True, 
-                pad_token_id=tokenizer.eos_token_id
-            )
-        answer = tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
+        
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        generation_kwargs = dict(
+            **inputs,
+            streamer=streamer,
+            max_new_tokens=450,
+            temperature=0.3,
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=3,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+        
+        thread = Thread(target=model.generate, kwargs=generation_kwargs)
+        thread.start()
+        
+        for new_text in streamer:
+            yield new_text
     else:
-        answer = polish_answer(" ".join([t.split("]: ")[1] for t in top_context]))
-    return answer, sorted(list(set(used_indices)))
+        yield polish_answer(" ".join([t.split("]: ")[1] for t in top_context]))
 
 def search(embed_model: SentenceTransformer, rerank_model: CrossEncoder, index: faiss.Index, chunks: List[ChunkRecord], query: str, top_k: int) -> List[Dict[str, Any]]:
     q_emb = embed_model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
@@ -270,14 +284,18 @@ def main():
         prompt = st.chat_input("Ask about your document...")
         if prompt:
             st.session_state.chat.append({"role": "user", "content": prompt})
-            with st.chat_message("user"): st.markdown(prompt)
+            st.chat_message("user").markdown(prompt)
             
             with st.chat_message("assistant"):
-                with st.spinner("Analyzing..."):
+                # Always show context retrieval spinner briefly
+                with st.spinner("Finding relevant information..."):
                     results = search(embed_model, rerank_model, st.session_state.dataset["index"], st.session_state.dataset["chunks"], prompt, top_k=6)
-                    answer, _ = synthesize_answer(results, prompt, reasoning_module=reasoning_module)
-                    st.markdown(answer)
-            st.session_state.chat.append({"role": "assistant", "content": answer})
+                
+                # Stream the answer
+                response_placeholder = st.empty()
+                full_response = st.write_stream(synthesize_answer(results, prompt, reasoning_module=reasoning_module))
+                
+            st.session_state.chat.append({"role": "assistant", "content": full_response})
             st.session_state.history.insert(0, prompt)
 
 if __name__ == "__main__":

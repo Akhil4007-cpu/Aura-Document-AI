@@ -51,7 +51,8 @@ def setup_nltk():
 @st.cache_resource(show_spinner=False)
 def load_reasoning_module() -> Tuple[Any, Any]:
     tokenizer = AutoTokenizer.from_pretrained(REASONING_MODEL)
-    model = AutoModelForCausalLM.from_pretrained(REASONING_MODEL, torch_dtype=torch.float32, low_cpu_mem_usage=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForCausalLM.from_pretrained(REASONING_MODEL, torch_dtype=torch.float32, low_cpu_mem_usage=True).to(device)
     return tokenizer, model
 
 def polish_answer(text: str) -> str:
@@ -96,7 +97,6 @@ def normalize_whitespace(text: str) -> str:
     return text.strip()
 
 def chunk_text(text: str, doc_name: str, page_num: int, chunk_size: int = 1200, overlap_sentences: int = 2) -> List[ChunkRecord]:
-    setup_nltk()
     text = normalize_whitespace(text)
     if not text: return []
     try:
@@ -152,31 +152,39 @@ def extract_keywords(query: str) -> List[str]:
 def synthesize_answer(results: List[Dict[str, Any]], query: str, reasoning_module: Optional[Tuple[Any, Any]] = None, max_sentences: int = 4) -> Tuple[str, List[int]]:
     if not results: return "Information not found in context.", []
     top_context, used_indices = [], []
-    for i, r in enumerate(results[:5]):
+    seen_text = set()
+    for i, r in enumerate(results[:6]):
         text = r.get("text", "").strip()
-        if len(text) > 30:
+        # Deduplication check
+        text_hash = text[:100] # Use prefix as a simple hash
+        if len(text) > 30 and text_hash not in seen_text:
             top_context.append(f"[Source {i+1}]: {text}")
             used_indices.append(i)
+            seen_text.add(text_hash)
     if not top_context: return "Information not found in context.", []
     context_str = "\n\n".join(top_context)
     if reasoning_module:
         tokenizer, model = reasoning_module
         system_msg = (
-            "You are a precise PDF analysis assistant and a Programming Expert. "
-            "Use the provided context as your master reference and coding standard. "
-            "1. If the user asks for NEW code not explicitly in the book, use the book's logic, patterns, and style to build it from scratch. "
-            "2. For all programming tasks, provide clean, well-commented code in Markdown Blocks (```language). "
-            "3. If asked for a list/summary, use bullet points. "
-            "4. If no relevant pattern is found in the context, say 'Information not found'."
+            "You are a PDF analysis assistant. Use the context to answer precisely. "
+            "If asked for code, use Markdown blocks. If no relevant info is found, say 'Information not found'."
         )
         messages = [
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": f"Context from Textbook:\n{context_str}\n\nUser Request: {query}"}
+            {"role": "user", "content": f"Context:\n{context_str}\n\nQuestion: {query}"}
         ]
         input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(input_text, return_tensors="pt")
+        inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
         with torch.no_grad():
-            outputs = model.generate(inputs["input_ids"], max_new_tokens=400, temperature=0.1, do_sample=True, pad_token_id=tokenizer.eos_token_id)
+            outputs = model.generate(
+                inputs["input_ids"], 
+                max_new_tokens=350, 
+                temperature=0.3, 
+                repetition_penalty=1.15,
+                no_repeat_ngram_size=3,
+                do_sample=True, 
+                pad_token_id=tokenizer.eos_token_id
+            )
         answer = tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
     else:
         answer = polish_answer(" ".join([t.split("]: ")[1] for t in top_context]))
@@ -232,6 +240,7 @@ def main():
     if "dataset" not in st.session_state: st.session_state.dataset = None
     if "history" not in st.session_state: st.session_state.history = []
 
+    setup_nltk()
     embed_model = load_embed_model()
     rerank_model = load_rerank_model()
     reasoning_module = load_reasoning_module()

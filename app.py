@@ -2,7 +2,7 @@ import re
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import faiss
 import numpy as np
@@ -197,11 +197,12 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
     return sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_k]
 
 # =========================
-# SMART ANSWER FORMATTING
+# STREAMING ANSWER
 # =========================
-def synthesize_answer(results, query, tokenizer, model):
+def synthesize_answer_stream(results, query, tokenizer, model):
     if not results:
-        return "Information not found."
+        yield "Information not found."
+        return
 
     context = "\n\n".join([r["text"] for r in results[:2]])
 
@@ -211,19 +212,16 @@ def synthesize_answer(results, query, tokenizer, model):
 
     if needs_code:
         prompt = f"""
-Answer the question using the context.
+Answer using the context.
 
-Rules:
-- First give a short explanation
-- Then provide clean code
-- Keep it simple and correct
+STRICT FORMAT:
 
-Format:
 Explanation:
-...
+- point 1
+- point 2
 
 Code:
-...
+<code>
 
 Context:
 {context}
@@ -235,17 +233,12 @@ Answer:
 """
     else:
         prompt = f"""
-Answer the question using the context.
+Answer using the context.
 
-Rules:
-- Use simple English
-- Give answer in bullet points
-- Be short and clear
-
-Format:
-- Point 1
-- Point 2
-- Point 3
+RULES:
+- MUST use bullet points
+- Each line starts with "-"
+- Keep it short
 
 Context:
 {context}
@@ -258,15 +251,18 @@ Answer:
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
 
-    output = model.generate(
+    output_ids = model.generate(
         **inputs,
         max_new_tokens=200,
         temperature=0.2
     )
 
-    response = tokenizer.decode(output[0], skip_special_tokens=True)
+    response = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    final = response.split("Answer:")[-1].strip()
 
-    return response.split("Answer:")[-1].strip()
+    # streaming effect
+    for i in range(0, len(final), 25):
+        yield final[i:i+25]
 
 # =========================
 # BUILD DATASET
@@ -326,10 +322,12 @@ def main():
                 top_k=3
             )
 
-            answer = synthesize_answer(results, query, tokenizer, model)
+            placeholder = st.empty()
+            full_text = ""
 
-            st.markdown("### Answer")
-            st.write(answer)
+            for chunk in synthesize_answer_stream(results, query, tokenizer, model):
+                full_text += chunk
+                placeholder.markdown(full_text)
 
 if __name__ == "__main__":
     main()

@@ -3,7 +3,6 @@ from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
-from threading import Thread
 
 import faiss
 import numpy as np
@@ -12,7 +11,7 @@ import streamlit as st
 import docx
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 APP_DIR = Path(__file__).resolve().parent
 MODEL_NAME = "all-MiniLM-L6-v2"
@@ -150,46 +149,43 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
     return sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_k]
 
 # =========================
-# STREAMING ANSWER (FIXED)
+# ANSWER (STABLE)
 # =========================
-def synthesize_answer_stream(results, query, tokenizer, model):
+def synthesize_answer(results, query, tokenizer, model):
     if not results:
-        yield "Information not found."
-        return
+        return "Information not found."
 
-    context = "\n\n".join([r["text"] for r in results[:2]])
+    # 🔥 Only top 1 chunk (important)
+    context = results[0]["text"]
 
     prompt = f"""
-Use ONLY the information from the context.
+Answer the question briefly using this:
 
-If answer is not present, say "Not found in document".
-
-Context:
 {context}
 
-Question:
-{query}
+Question: {query}
 
-Answer in short bullet points:
+Answer in 3-4 bullet points:
 """
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
 
-    streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=True)
-
-    generation_kwargs = dict(
+    output = model.generate(
         **inputs,
-        streamer=streamer,
-        max_new_tokens=150,
+        max_new_tokens=120,
         temperature=0.1,
         do_sample=False
     )
 
-    thread = Thread(target=model.generate, kwargs=generation_kwargs)
-    thread.start()
+    response = tokenizer.decode(output[0], skip_special_tokens=True)
 
-    for token in streamer:
-        yield token
+    # extract clean answer
+    if "Answer" in response:
+        answer = response.split("Answer")[-1]
+    else:
+        answer = response
+
+    return answer.strip()
 
 # =========================
 # BUILD DATASET
@@ -249,12 +245,10 @@ def main():
                 top_k=3
             )
 
-            placeholder = st.empty()
-            full_text = ""
+            answer = synthesize_answer(results, query, tokenizer, model)
 
-            for token in synthesize_answer_stream(results, query, tokenizer, model):
-                full_text += token
-                placeholder.markdown(full_text)
+            st.markdown("### Answer")
+            st.markdown(answer)
 
 if __name__ == "__main__":
     main()

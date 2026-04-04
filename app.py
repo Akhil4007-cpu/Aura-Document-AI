@@ -1,9 +1,8 @@
-import hashlib
 import re
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import List, Tuple
 
 import faiss
 import numpy as np
@@ -13,10 +12,12 @@ import nltk
 import docx
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer, CrossEncoder
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 APP_DIR = Path(__file__).resolve().parent
 MODEL_NAME = "all-MiniLM-L6-v2"
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+REASONING_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 
 # =========================
 # DATA STRUCTURE
@@ -31,22 +32,25 @@ class ChunkRecord:
     doc_type: str
 
 # =========================
-# MODEL LOADERS
+# LOAD MODELS
 # =========================
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_embed_model():
     return SentenceTransformer(MODEL_NAME)
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_rerank_model():
     return CrossEncoder(RERANK_MODEL)
 
-@st.cache_resource(show_spinner=False)
-def setup_nltk():
-    nltk.download('punkt', quiet=True)
+@st.cache_resource
+def load_reasoning_model():
+    tokenizer = AutoTokenizer.from_pretrained(REASONING_MODEL)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForCausalLM.from_pretrained(REASONING_MODEL).to(device)
+    return tokenizer, model
 
 # =========================
-# CLASSIFIERS
+# CLASSIFICATION
 # =========================
 def classify_document(text):
     text = text.lower()
@@ -58,7 +62,7 @@ def classify_document(text):
 
 def classify_query(query):
     q = query.lower()
-    if any(k in q for k in ["my", "me", "mine", "about me"]):
+    if any(k in q for k in ["my", "me", "mine"]):
         return "personal"
     if any(k in q for k in ["explain", "what is", "how"]):
         return "study"
@@ -101,7 +105,6 @@ def chunk_text(text, doc_name, page_num, chunk_size=1200):
     sentences = re.split(r'(?<=[.!?])\s+', text)
 
     doc_type = classify_document(text)
-
     chunks = []
     current = ""
 
@@ -111,24 +114,24 @@ def chunk_text(text, doc_name, page_num, chunk_size=1200):
         else:
             chunk_id = len(chunks)
             chunks.append(ChunkRecord(
-                doc_id=f"{doc_name}_{page_num}_{chunk_id}",
-                doc_name=doc_name,
-                page=page_num,
-                chunk_id=chunk_id,
-                text=current.strip(),
-                doc_type=doc_type
+                f"{doc_name}_{page_num}_{chunk_id}",
+                doc_name,
+                page_num,
+                chunk_id,
+                current.strip(),
+                doc_type
             ))
             current = sent
 
     if current:
         chunk_id = len(chunks)
         chunks.append(ChunkRecord(
-            doc_id=f"{doc_name}_{page_num}_{chunk_id}",
-            doc_name=doc_name,
-            page=page_num,
-            chunk_id=chunk_id,
-            text=current.strip(),
-            doc_type=doc_type
+            f"{doc_name}_{page_num}_{chunk_id}",
+            doc_name,
+            page_num,
+            chunk_id,
+            current.strip(),
+            doc_type
         ))
 
     return chunks
@@ -145,7 +148,7 @@ def extract_keywords(query):
     return re.findall(r"\w+", query.lower())
 
 # =========================
-# SEARCH (FIXED)
+# SEARCH (SMART FALLBACK)
 # =========================
 def search(embed_model, rerank_model, index, chunks, query, top_k):
     query_type = classify_query(query)
@@ -153,48 +156,40 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
     q_emb = embed_model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
     scores, ids = index.search(q_emb, max(top_k * 4, 30))
 
-    candidates = []
     keywords = extract_keywords(query)
 
-    # First pass (filtered)
-    for score, idx in zip(scores[0], ids[0]):
-        if idx < 0 or idx >= len(chunks):
-            continue
-
-        c = chunks[idx]
-
-        if query_type != "general" and c.doc_type != query_type:
-            continue
-
-        boost = float(score)
-
-        for kw in keywords:
-            if kw in c.text.lower():
-                boost += 0.5
-
-        candidates.append({
-            "text": c.text,
-            "doc_name": c.doc_name,
-            "page": c.page,
-            "score": boost
-        })
-
-    # 🔥 Fallback if empty
-    if not candidates:
+    def build_candidates(mode):
+        candidates = []
         for score, idx in zip(scores[0], ids[0]):
             if idx < 0 or idx >= len(chunks):
                 continue
 
             c = chunks[idx]
+            boost = float(score)
+
+            if mode == "strict" and query_type != "general" and c.doc_type != query_type:
+                continue
+
+            if mode == "soft" and c.doc_type == query_type:
+                boost += 1.0
+
+            for kw in keywords:
+                if kw in c.text.lower():
+                    boost += 0.5
 
             candidates.append({
                 "text": c.text,
                 "doc_name": c.doc_name,
-                "page": c.page,
-                "score": float(score)
+                "score": boost
             })
 
-    # Rerank
+        return candidates
+
+    candidates = build_candidates("strict") or build_candidates("soft") or build_candidates("none")
+
+    if not candidates:
+        return []
+
     rerank_scores = rerank_model.predict([[query, c["text"]] for c in candidates])
 
     for s, c in zip(rerank_scores, candidates):
@@ -203,14 +198,43 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
     return sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_k]
 
 # =========================
-# ANSWER
+# MULTI-DOC REASONING
 # =========================
-def synthesize_answer(results):
+def synthesize_answer(results, query, tokenizer, model):
     if not results:
         return "Information not found."
 
-    context = "\n\n".join([r["text"] for r in results[:3]])
-    return context[:1500]
+    context_blocks = []
+    for i, r in enumerate(results[:5]):
+        context_blocks.append(f"[Doc {i+1} - {r['doc_name']}]: {r['text']}")
+
+    context = "\n\n".join(context_blocks)
+
+    prompt = f"""
+You are an intelligent assistant.
+
+Combine information from multiple documents and answer clearly.
+
+Context:
+{context}
+
+Question:
+{query}
+
+Answer:
+"""
+
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
+
+    output = model.generate(
+        **inputs,
+        max_new_tokens=300,
+        temperature=0.3
+    )
+
+    response = tokenizer.decode(output[0], skip_special_tokens=True)
+
+    return response.split("Answer:")[-1].strip()
 
 # =========================
 # BUILD DATASET
@@ -220,7 +244,6 @@ def build_dataset(files):
 
     for name, content in files:
         pages = extract_text_from_file(content, name)
-
         for page_num, text in pages:
             all_chunks.extend(chunk_text(text, name, page_num))
 
@@ -242,10 +265,10 @@ def build_dataset(files):
 def main():
     st.set_page_config(page_title="Universal AI Reviewer", layout="wide")
 
+    st.title("Universal AI Reviewer")
+
     if "dataset" not in st.session_state:
         st.session_state.dataset = None
-
-    st.title("Universal AI Reviewer")
 
     uploaded = st.file_uploader("Upload Documents", accept_multiple_files=True)
 
@@ -255,11 +278,12 @@ def main():
         st.success("Index built successfully!")
 
     if st.session_state.dataset:
-        query = st.text_input("Ask about your documents")
+        query = st.text_input("Ask your question")
 
         if query:
             embed_model = load_embed_model()
             rerank_model = load_rerank_model()
+            tokenizer, model = load_reasoning_model()
 
             results = search(
                 embed_model,
@@ -270,7 +294,7 @@ def main():
                 top_k=6
             )
 
-            answer = synthesize_answer(results)
+            answer = synthesize_answer(results, query, tokenizer, model)
 
             st.markdown("### Answer")
             st.write(answer)

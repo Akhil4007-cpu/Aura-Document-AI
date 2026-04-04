@@ -8,7 +8,6 @@ import faiss
 import numpy as np
 import torch
 import streamlit as st
-import nltk
 import docx
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -32,7 +31,7 @@ class ChunkRecord:
     doc_type: str
 
 # =========================
-# LOAD MODELS
+# MODEL LOADERS
 # =========================
 @st.cache_resource
 def load_embed_model():
@@ -198,22 +197,55 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
     return sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_k]
 
 # =========================
-# MULTI-DOC REASONING
+# SMART ANSWER FORMATTING
 # =========================
 def synthesize_answer(results, query, tokenizer, model):
     if not results:
         return "Information not found."
 
-    context_blocks = []
-    for i, r in enumerate(results[:5]):
-        context_blocks.append(f"[Doc {i+1} - {r['doc_name']}]: {r['text']}")
+    context = "\n\n".join([r["text"] for r in results[:2]])
 
-    context = "\n\n".join(context_blocks)
+    q = query.lower()
+    code_keywords = ["code", "program", "implement", "python", "write"]
+    needs_code = any(k in q for k in code_keywords)
 
-    prompt = f"""
-You are an intelligent assistant.
+    if needs_code:
+        prompt = f"""
+Answer the question using the context.
 
-Combine information from multiple documents and answer clearly.
+Rules:
+- First give a short explanation
+- Then provide clean code
+- Keep it simple and correct
+
+Format:
+Explanation:
+...
+
+Code:
+...
+
+Context:
+{context}
+
+Question:
+{query}
+
+Answer:
+"""
+    else:
+        prompt = f"""
+Answer the question using the context.
+
+Rules:
+- Use simple English
+- Give answer in bullet points
+- Be short and clear
+
+Format:
+- Point 1
+- Point 2
+- Point 3
 
 Context:
 {context}
@@ -228,8 +260,8 @@ Answer:
 
     output = model.generate(
         **inputs,
-        max_new_tokens=300,
-        temperature=0.3
+        max_new_tokens=200,
+        temperature=0.2
     )
 
     response = tokenizer.decode(output[0], skip_special_tokens=True)
@@ -291,7 +323,7 @@ def main():
                 st.session_state.dataset["index"],
                 st.session_state.dataset["chunks"],
                 query,
-                top_k=6
+                top_k=3
             )
 
             answer = synthesize_answer(results, query, tokenizer, model)

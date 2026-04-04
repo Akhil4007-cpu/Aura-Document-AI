@@ -149,43 +149,52 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
     return sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_k]
 
 # =========================
-# ANSWER (STABLE)
+# ANSWER (FINAL FIXED)
 # =========================
 def synthesize_answer(results, query, tokenizer, model):
     if not results:
         return "Information not found."
 
-    # 🔥 Only top 1 chunk (important)
     context = results[0]["text"]
 
     prompt = f"""
-Answer the question briefly using this:
+Answer briefly using the following:
 
 {context}
 
 Question: {query}
 
-Answer in 3-4 bullet points:
+Answer:
 """
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
 
     output = model.generate(
         **inputs,
-        max_new_tokens=120,
+        max_new_tokens=200,
         temperature=0.1,
         do_sample=False
     )
 
     response = tokenizer.decode(output[0], skip_special_tokens=True)
 
-    # extract clean answer
-    if "Answer" in response:
-        answer = response.split("Answer")[-1]
+    # Extract answer safely
+    if "Answer:" in response:
+        answer = response.split("Answer:")[-1]
     else:
         answer = response
 
-    return answer.strip()
+    # Force clean bullet structure
+    sentences = re.split(r'[.\n]', answer)
+    cleaned = []
+
+    for s in sentences:
+        s = s.strip()
+        if len(s) < 5:
+            continue
+        cleaned.append(f"- {s}")
+
+    return "\n".join(cleaned[:5])
 
 # =========================
 # BUILD DATASET

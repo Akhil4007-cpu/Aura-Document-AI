@@ -3,6 +3,7 @@ from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
+from threading import Thread
 
 import faiss
 import numpy as np
@@ -11,7 +12,7 @@ import streamlit as st
 import docx
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
 
 APP_DIR = Path(__file__).resolve().parent
 MODEL_NAME = "all-MiniLM-L6-v2"
@@ -31,7 +32,7 @@ class ChunkRecord:
     doc_type: str
 
 # =========================
-# MODEL LOADERS
+# MODELS
 # =========================
 @st.cache_resource
 def load_embed_model():
@@ -147,7 +148,7 @@ def extract_keywords(query):
     return re.findall(r"\w+", query.lower())
 
 # =========================
-# SEARCH (SMART FALLBACK)
+# SEARCH
 # =========================
 def search(embed_model, rerank_model, index, chunks, query, top_k):
     query_type = classify_query(query)
@@ -155,39 +156,35 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
     q_emb = embed_model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
     scores, ids = index.search(q_emb, max(top_k * 4, 30))
 
-    keywords = extract_keywords(query)
+    candidates = []
 
-    def build_candidates(mode):
-        candidates = []
+    for score, idx in zip(scores[0], ids[0]):
+        if idx < 0 or idx >= len(chunks):
+            continue
+
+        c = chunks[idx]
+
+        if query_type != "general" and c.doc_type != query_type:
+            continue
+
+        candidates.append({
+            "text": c.text,
+            "doc_name": c.doc_name,
+            "score": float(score)
+        })
+
+    if not candidates:
         for score, idx in zip(scores[0], ids[0]):
             if idx < 0 or idx >= len(chunks):
                 continue
 
             c = chunks[idx]
-            boost = float(score)
-
-            if mode == "strict" and query_type != "general" and c.doc_type != query_type:
-                continue
-
-            if mode == "soft" and c.doc_type == query_type:
-                boost += 1.0
-
-            for kw in keywords:
-                if kw in c.text.lower():
-                    boost += 0.5
 
             candidates.append({
                 "text": c.text,
                 "doc_name": c.doc_name,
-                "score": boost
+                "score": float(score)
             })
-
-        return candidates
-
-    candidates = build_candidates("strict") or build_candidates("soft") or build_candidates("none")
-
-    if not candidates:
-        return []
 
     rerank_scores = rerank_model.predict([[query, c["text"]] for c in candidates])
 
@@ -197,7 +194,7 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
     return sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_k]
 
 # =========================
-# STREAMING ANSWER
+# REAL STREAMING ANSWER
 # =========================
 def synthesize_answer_stream(results, query, tokenizer, model):
     if not results:
@@ -206,63 +203,32 @@ def synthesize_answer_stream(results, query, tokenizer, model):
 
     context = "\n\n".join([r["text"] for r in results[:2]])
 
-    q = query.lower()
-    code_keywords = ["code", "program", "implement", "python", "write"]
-    needs_code = any(k in q for k in code_keywords)
-
-    if needs_code:
-        prompt = f"""
-Answer using the context.
-
-STRICT FORMAT:
-
-Explanation:
-- point 1
-- point 2
-
-Code:
-<code>
-
+    prompt = f"""
 Context:
 {context}
 
 Question:
 {query}
 
-Answer:
-"""
-    else:
-        prompt = f"""
-Answer using the context.
-
-RULES:
-- MUST use bullet points
-- Each line starts with "-"
-- Keep it short
-
-Context:
-{context}
-
-Question:
-{query}
-
-Answer:
+Answer in bullet points:
 """
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
 
-    output_ids = model.generate(
+    streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=True)
+
+    generation_kwargs = dict(
         **inputs,
+        streamer=streamer,
         max_new_tokens=200,
-        temperature=0.2
+        temperature=0.2,
     )
 
-    response = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    final = response.split("Answer:")[-1].strip()
+    thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
 
-    # streaming effect
-    for i in range(0, len(final), 25):
-        yield final[i:i+25]
+    for new_text in streamer:
+        yield new_text
 
 # =========================
 # BUILD DATASET
@@ -325,8 +291,8 @@ def main():
             placeholder = st.empty()
             full_text = ""
 
-            for chunk in synthesize_answer_stream(results, query, tokenizer, model):
-                full_text += chunk
+            for token in synthesize_answer_stream(results, query, tokenizer, model):
+                full_text += token
                 placeholder.markdown(full_text)
 
 if __name__ == "__main__":

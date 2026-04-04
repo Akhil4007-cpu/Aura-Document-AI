@@ -1,11 +1,9 @@
 import hashlib
 import re
-import time
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
-from threading import Thread
+from typing import Any, Dict, List, Tuple
 
 import faiss
 import numpy as np
@@ -14,14 +12,15 @@ import streamlit as st
 import nltk
 import docx
 from pypdf import PdfReader
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 APP_DIR = Path(__file__).resolve().parent
 MODEL_NAME = "all-MiniLM-L6-v2"
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-REASONING_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 
+# =========================
+# DATA STRUCTURE
+# =========================
 @dataclass
 class ChunkRecord:
     doc_id: str
@@ -29,44 +28,48 @@ class ChunkRecord:
     page: int
     chunk_id: int
     text: str
+    doc_type: str
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
+# =========================
+# MODEL LOADERS
+# =========================
 @st.cache_resource(show_spinner=False)
-def load_embed_model() -> SentenceTransformer:
+def load_embed_model():
     return SentenceTransformer(MODEL_NAME)
 
 @st.cache_resource(show_spinner=False)
-def load_rerank_model() -> CrossEncoder:
+def load_rerank_model():
     return CrossEncoder(RERANK_MODEL)
 
 @st.cache_resource(show_spinner=False)
 def setup_nltk():
-    try:
-        nltk.download('punkt', quiet=True)
-        nltk.download('punkt_tab', quiet=True)
-    except Exception as e:
-        print(f"NLTK Download Warning: {e}")
+    nltk.download('punkt', quiet=True)
 
-@st.cache_resource(show_spinner=False)
-def load_reasoning_module() -> Tuple[Any, Any]:
-    tokenizer = AutoTokenizer.from_pretrained(REASONING_MODEL)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = AutoModelForCausalLM.from_pretrained(REASONING_MODEL, torch_dtype=torch.float32, low_cpu_mem_usage=True).to(device)
-    return tokenizer, model
+# =========================
+# CLASSIFIERS
+# =========================
+def classify_document(text):
+    text = text.lower()
+    if any(k in text for k in ["about me", "my name is", "i am", "my goal"]):
+        return "personal"
+    elif any(k in text for k in ["introduction", "chapter", "definition", "algorithm"]):
+        return "study"
+    return "general"
 
-def polish_answer(text: str) -> str:
-    if not text: return ""
-    text = text.strip()
-    if text and text[0].islower():
-        text = text[0].upper() + text[1:]
-    return text
+def classify_query(query):
+    q = query.lower()
+    if any(k in q for k in ["my", "me", "mine", "about me"]):
+        return "personal"
+    if any(k in q for k in ["explain", "what is", "how"]):
+        return "study"
+    return "general"
 
-def extract_text_from_file(content_bytes: bytes, filename: str) -> List[Tuple[int, str]]:
-    """Universal Extractor for PDF, DOCX, and TXT."""
-    pages: List[Tuple[int, str]] = []
-    
+# =========================
+# EXTRACTION
+# =========================
+def extract_text_from_file(content_bytes, filename):
+    pages = []
+
     if filename.lower().endswith(".pdf"):
         reader = PdfReader(BytesIO(content_bytes))
         for i, page in enumerate(reader.pages):
@@ -74,229 +77,203 @@ def extract_text_from_file(content_bytes: bytes, filename: str) -> List[Tuple[in
                 text = page.extract_text() or ""
             except:
                 text = ""
-            pages.append((i + 1, text.replace("\x00", " ")))
-            
+            pages.append((i + 1, text))
+
     elif filename.lower().endswith(".docx"):
         doc = docx.Document(BytesIO(content_bytes))
-        # Word docs don't have true 'pages' in the buffer, so we treat it as one or by section
-        full_text = "\n".join([para.text for para in doc.paragraphs])
-        pages.append((1, full_text))
-        
-    elif filename.lower().endswith(".txt"):
-        try:
-            text = content_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            text = content_bytes.decode("latin-1")
+        text = "\n".join([p.text for p in doc.paragraphs])
         pages.append((1, text))
-        
+
+    elif filename.lower().endswith(".txt"):
+        text = content_bytes.decode("utf-8", errors="ignore")
+        pages.append((1, text))
+
     return pages
 
-def normalize_whitespace(text: str) -> str:
-    text = text.replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+# =========================
+# CHUNKING
+# =========================
+def normalize_whitespace(text):
+    return re.sub(r"\s+", " ", text).strip()
 
-def chunk_text(text: str, doc_name: str, page_num: int, chunk_size: int = 1200, overlap_sentences: int = 2) -> List[ChunkRecord]:
+def chunk_text(text, doc_name, page_num, chunk_size=1200):
     text = normalize_whitespace(text)
-    if not text: return []
-    try:
-        from nltk.tokenize import sent_tokenize
-        sentences = sent_tokenize(text)
-    except:
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-    
-    chunks: List[ChunkRecord] = []
-    current_chunk = []
-    current_length = 0
-    for i, sent in enumerate(sentences):
-        sent = sent.strip()
-        if not sent: continue
-        current_chunk.append(sent)
-        current_length += len(sent)
-        if current_length >= chunk_size:
-            chunk_block = " ".join(current_chunk)
-            chunk_idx = len(chunks)
-            chunks.append(ChunkRecord(str(chunk_idx), doc_name, page_num, chunk_idx, chunk_block))
-            if len(current_chunk) > overlap_sentences:
-                current_chunk = current_chunk[-overlap_sentences:]
-                current_length = sum(len(s) for s in current_chunk)
-            else:
-                current_chunk, current_length = [], 0
-    if current_chunk:
-        chunk_block = " ".join(current_chunk)
-        chunk_idx = len(chunks)
-        chunks.append(ChunkRecord(str(chunk_idx), doc_name, page_num, chunk_idx, chunk_block))
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    doc_type = classify_document(text)
+
+    chunks = []
+    current = ""
+
+    for sent in sentences:
+        if len(current) + len(sent) < chunk_size:
+            current += " " + sent
+        else:
+            chunk_id = len(chunks)
+            chunks.append(ChunkRecord(
+                doc_id=f"{doc_name}_{page_num}_{chunk_id}",
+                doc_name=doc_name,
+                page=page_num,
+                chunk_id=chunk_id,
+                text=current.strip(),
+                doc_type=doc_type
+            ))
+            current = sent
+
+    if current:
+        chunk_id = len(chunks)
+        chunks.append(ChunkRecord(
+            doc_id=f"{doc_name}_{page_num}_{chunk_id}",
+            doc_name=doc_name,
+            page=page_num,
+            chunk_id=chunk_id,
+            text=current.strip(),
+            doc_type=doc_type
+        ))
+
     return chunks
 
-def embed_texts_with_progress(model: SentenceTransformer, texts: List[str], batch_size: int = 64, progress: Any = None) -> np.ndarray:
-    if not texts: return np.zeros((0, 384), dtype=np.float32)
-    vectors = []
-    total = len(texts)
-    for i in range(0, total, batch_size):
-        batch = texts[i : i + batch_size]
-        batch_vec = model.encode(batch, batch_size=batch_size, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-        vectors.append(batch_vec)
-        if progress is not None:
-            progress.progress(min(1.0, (i + len(batch)) / total))
-    return np.vstack(vectors)
-
-def build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
+# =========================
+# FAISS
+# =========================
+def build_faiss_index(embeddings):
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
     return index
 
-def extract_keywords(query: str) -> List[str]:
-    stopwords = {"what", "who", "is", "of", "the", "in", "and", "a", "an", "to", "for", "with", "his", "her", "their", "are", "by", "from", "at"}
-    return [w for w in re.findall(r"\w+", query.lower()) if w not in stopwords and len(w) > 2]
+def extract_keywords(query):
+    return re.findall(r"\w+", query.lower())
 
-def synthesize_answer(results: List[Dict[str, Any]], query: str, reasoning_module: Optional[Tuple[Any, Any]] = None):
-    if not results:
-        yield "Information not found in context."
-        return
-    
-    top_context, used_indices = [], []
-    seen_text = set()
-    for i, r in enumerate(results[:6]):
-        text = r.get("text", "").strip()
-        text_hash = text[:100]
-        if len(text) > 30 and text_hash not in seen_text:
-            top_context.append(f"[Source {i+1}]: {text}")
-            used_indices.append(i)
-            seen_text.add(text_hash)
-            
-    if not top_context:
-        yield "Information not found in context."
-        return
+# =========================
+# SEARCH (FIXED)
+# =========================
+def search(embed_model, rerank_model, index, chunks, query, top_k):
+    query_type = classify_query(query)
 
-    context_str = "\n\n".join(top_context)
-    
-    if reasoning_module:
-        tokenizer, model = reasoning_module
-        system_msg = (
-            "You are a PDF analysis assistant. Use the context to answer precisely. "
-            "If asked for code, use Markdown blocks. If no relevant info is found, say 'Information not found'."
-        )
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": f"Context:\n{context_str}\n\nQuestion: {query}"}
-        ]
-        input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
-        
-        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-        generation_kwargs = dict(
-            **inputs,
-            streamer=streamer,
-            max_new_tokens=450,
-            temperature=0.3,
-            repetition_penalty=1.15,
-            no_repeat_ngram_size=3,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id
-        )
-        
-        thread = Thread(target=model.generate, kwargs=generation_kwargs)
-        thread.start()
-        
-        for new_text in streamer:
-            yield new_text
-    else:
-        yield polish_answer(" ".join([t.split("]: ")[1] for t in top_context]))
-
-def search(embed_model: SentenceTransformer, rerank_model: CrossEncoder, index: faiss.Index, chunks: List[ChunkRecord], query: str, top_k: int) -> List[Dict[str, Any]]:
     q_emb = embed_model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
     scores, ids = index.search(q_emb, max(top_k * 4, 30))
-    candidates, keywords = [], extract_keywords(query)
-    for score, idx in zip(scores[0].tolist(), ids[0].tolist()):
-        if idx < 0 or idx >= len(chunks): continue
+
+    candidates = []
+    keywords = extract_keywords(query)
+
+    # First pass (filtered)
+    for score, idx in zip(scores[0], ids[0]):
+        if idx < 0 or idx >= len(chunks):
+            continue
+
         c = chunks[idx]
-        b_score = float(score)
+
+        if query_type != "general" and c.doc_type != query_type:
+            continue
+
+        boost = float(score)
+
         for kw in keywords:
-            if kw in c.text.lower(): b_score += 0.5
-        candidates.append({"text": c.text, "doc_name": c.doc_name, "page": c.page, "chunk_id": c.chunk_id, "score": b_score})
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    candidates = candidates[:max(top_k * 2, 20)]
+            if kw in c.text.lower():
+                boost += 0.5
+
+        candidates.append({
+            "text": c.text,
+            "doc_name": c.doc_name,
+            "page": c.page,
+            "score": boost
+        })
+
+    # 🔥 Fallback if empty
+    if not candidates:
+        for score, idx in zip(scores[0], ids[0]):
+            if idx < 0 or idx >= len(chunks):
+                continue
+
+            c = chunks[idx]
+
+            candidates.append({
+                "text": c.text,
+                "doc_name": c.doc_name,
+                "page": c.page,
+                "score": float(score)
+            })
+
+    # Rerank
     rerank_scores = rerank_model.predict([[query, c["text"]] for c in candidates])
-    results = []
-    for s, c in zip(rerank_scores.tolist(), candidates):
+
+    for s, c in zip(rerank_scores, candidates):
         c["score"] = float(s)
-        results.append(c)
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_k]
 
-def build_dataset(files: List[Tuple[str, bytes]]) -> Dict[str, Any]:
+    return sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_k]
+
+# =========================
+# ANSWER
+# =========================
+def synthesize_answer(results):
+    if not results:
+        return "Information not found."
+
+    context = "\n\n".join([r["text"] for r in results[:3]])
+    return context[:1500]
+
+# =========================
+# BUILD DATASET
+# =========================
+def build_dataset(files):
     all_chunks = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    for i, (name, content) in enumerate(files):
-        status_text.info(f"Processing: **{name}** ({i+1}/{len(files)})")
-        # Now uses the Universal Extractor
-        pages_data = extract_text_from_file(content, name)
-        for page_num, text in pages_data:
+
+    for name, content in files:
+        pages = extract_text_from_file(content, name)
+
+        for page_num, text in pages:
             all_chunks.extend(chunk_text(text, name, page_num))
-        progress_bar.progress((i + 0.5) / len(files))
-    if not all_chunks:
-        progress_bar.empty()
-        status_text.empty()
-        return {}
-    status_text.info("🚀 Building High-Speed Vector Index...")
+
     embed_model = load_embed_model()
-    embeddings = embed_texts_with_progress(embed_model, [c.text for c in all_chunks], progress=progress_bar)
+
+    embeddings = embed_model.encode(
+        [c.text for c in all_chunks],
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    ).astype(np.float32)
+
     index = build_faiss_index(embeddings)
-    progress_bar.empty()
-    status_text.empty()
-    return {"index": index, "chunks": all_chunks, "embeddings": embeddings, "id": hashlib.md5(str(len(all_chunks)).encode()).hexdigest()[:10]}
 
+    return {"index": index, "chunks": all_chunks}
+
+# =========================
+# MAIN
+# =========================
 def main():
-    st.set_page_config(page_title="PDF AI Reviewer", layout="wide")
-    if "chat" not in st.session_state: st.session_state.chat = []
-    if "dataset" not in st.session_state: st.session_state.dataset = None
-    if "history" not in st.session_state: st.session_state.history = []
+    st.set_page_config(page_title="Universal AI Reviewer", layout="wide")
 
-    setup_nltk()
-    embed_model = load_embed_model()
-    rerank_model = load_rerank_model()
-    reasoning_module = load_reasoning_module()
-
-    with st.sidebar:
-        st.title("Settings")
-        # Now accepts all 3 formats
-        uploaded = st.file_uploader("Upload Documents", type=["pdf", "docx", "txt"], accept_multiple_files=True)
-        if st.button("Build/Reset Index") and uploaded:
-            mem_files = [(uf.name, uf.read()) for uf in uploaded]
-            st.session_state.dataset = build_dataset(mem_files)
-        if st.button("Clear Chat"):
-            st.session_state.chat = []
-            st.session_state.history = []
-        st.divider()
-        st.info(f"Using: {REASONING_MODEL}")
+    if "dataset" not in st.session_state:
+        st.session_state.dataset = None
 
     st.title("Universal AI Reviewer")
-    st.caption("Advanced reasoning for PDF, Word, and Text documents.")
 
-    if not st.session_state.dataset:
-        st.warning("Please upload and index a PDF to start.")
-    else:
-        for msg in st.session_state.chat[-10:]:
-            with st.chat_message(msg["role"]): st.markdown(msg["content"])
-        
-        prompt = st.chat_input("Ask about your document...")
-        if prompt:
-            st.session_state.chat.append({"role": "user", "content": prompt})
-            st.chat_message("user").markdown(prompt)
-            
-            with st.chat_message("assistant"):
-                # Always show context retrieval spinner briefly
-                with st.spinner("Finding relevant information..."):
-                    results = search(embed_model, rerank_model, st.session_state.dataset["index"], st.session_state.dataset["chunks"], prompt, top_k=6)
-                
-                # Stream the answer
-                response_placeholder = st.empty()
-                full_response = st.write_stream(synthesize_answer(results, prompt, reasoning_module=reasoning_module))
-                
-            st.session_state.chat.append({"role": "assistant", "content": full_response})
-            st.session_state.history.insert(0, prompt)
+    uploaded = st.file_uploader("Upload Documents", accept_multiple_files=True)
+
+    if st.button("Build Index") and uploaded:
+        files = [(f.name, f.read()) for f in uploaded]
+        st.session_state.dataset = build_dataset(files)
+        st.success("Index built successfully!")
+
+    if st.session_state.dataset:
+        query = st.text_input("Ask about your documents")
+
+        if query:
+            embed_model = load_embed_model()
+            rerank_model = load_rerank_model()
+
+            results = search(
+                embed_model,
+                rerank_model,
+                st.session_state.dataset["index"],
+                st.session_state.dataset["chunks"],
+                query,
+                top_k=6
+            )
+
+            answer = synthesize_answer(results)
+
+            st.markdown("### Answer")
+            st.write(answer)
 
 if __name__ == "__main__":
     main()

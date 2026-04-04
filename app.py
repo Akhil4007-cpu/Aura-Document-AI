@@ -137,6 +137,23 @@ def chunk_text(text, doc_name, page_num, chunk_size=1200):
     return chunks
 
 # =========================
+# CLEAN CONTEXT (IMPORTANT)
+# =========================
+def clean_context(text):
+    lines = text.split("\n")
+    cleaned = []
+
+    for line in lines:
+        line = line.strip()
+        if len(line) < 3:
+            continue
+        if "print(" in line or "=" in line:
+            continue
+        cleaned.append(line)
+
+    return " ".join(cleaned)
+
+# =========================
 # FAISS
 # =========================
 def build_faiss_index(embeddings):
@@ -144,15 +161,10 @@ def build_faiss_index(embeddings):
     index.add(embeddings)
     return index
 
-def extract_keywords(query):
-    return re.findall(r"\w+", query.lower())
-
 # =========================
 # SEARCH
 # =========================
 def search(embed_model, rerank_model, index, chunks, query, top_k):
-    query_type = classify_query(query)
-
     q_emb = embed_model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
     scores, ids = index.search(q_emb, max(top_k * 4, 30))
 
@@ -164,27 +176,11 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
 
         c = chunks[idx]
 
-        if query_type != "general" and c.doc_type != query_type:
-            continue
-
         candidates.append({
             "text": c.text,
             "doc_name": c.doc_name,
             "score": float(score)
         })
-
-    if not candidates:
-        for score, idx in zip(scores[0], ids[0]):
-            if idx < 0 or idx >= len(chunks):
-                continue
-
-            c = chunks[idx]
-
-            candidates.append({
-                "text": c.text,
-                "doc_name": c.doc_name,
-                "score": float(score)
-            })
 
     rerank_scores = rerank_model.predict([[query, c["text"]] for c in candidates])
 
@@ -194,23 +190,21 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
     return sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_k]
 
 # =========================
-# REAL STREAMING ANSWER
+# STREAMING + CLEAN OUTPUT
 # =========================
 def synthesize_answer_stream(results, query, tokenizer, model):
     if not results:
         yield "Information not found."
         return
 
-    context = "\n\n".join([r["text"] for r in results[:2]])
+    context = "\n\n".join([clean_context(r["text"]) for r in results[:2]])
 
     prompt = f"""
-Context:
+Summarize in 3-5 bullet points:
+
 {context}
 
-Question:
-{query}
-
-Answer in bullet points:
+Answer:
 """
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
@@ -220,15 +214,33 @@ Answer in bullet points:
     generation_kwargs = dict(
         **inputs,
         streamer=streamer,
-        max_new_tokens=200,
+        max_new_tokens=150,
         temperature=0.2,
     )
 
     thread = Thread(target=model.generate, kwargs=generation_kwargs)
     thread.start()
 
-    for new_text in streamer:
-        yield new_text
+    buffer = ""
+    for token in streamer:
+        buffer += token
+
+    # CLEAN OUTPUT
+    lines = buffer.split("\n")
+    final_lines = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if "Context" in line or "Question" in line:
+            continue
+        if not line.startswith("-"):
+            line = "- " + line
+        final_lines.append(line)
+
+    final = "\n".join(final_lines)
+    yield final
 
 # =========================
 # BUILD DATASET
@@ -289,11 +301,9 @@ def main():
             )
 
             placeholder = st.empty()
-            full_text = ""
 
-            for token in synthesize_answer_stream(results, query, tokenizer, model):
-                full_text += token
-                placeholder.markdown(full_text)
+            for output in synthesize_answer_stream(results, query, tokenizer, model):
+                placeholder.markdown(output)
 
 if __name__ == "__main__":
     main()

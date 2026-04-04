@@ -29,7 +29,6 @@ class ChunkRecord:
     page: int
     chunk_id: int
     text: str
-    doc_type: str
 
 # =========================
 # MODELS
@@ -48,25 +47,6 @@ def load_reasoning_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForCausalLM.from_pretrained(REASONING_MODEL).to(device)
     return tokenizer, model
-
-# =========================
-# CLASSIFICATION
-# =========================
-def classify_document(text):
-    text = text.lower()
-    if any(k in text for k in ["about me", "my name is", "i am", "my goal"]):
-        return "personal"
-    elif any(k in text for k in ["introduction", "chapter", "definition", "algorithm"]):
-        return "study"
-    return "general"
-
-def classify_query(query):
-    q = query.lower()
-    if any(k in q for k in ["my", "me", "mine"]):
-        return "personal"
-    if any(k in q for k in ["explain", "what is", "how"]):
-        return "study"
-    return "general"
 
 # =========================
 # EXTRACTION
@@ -104,7 +84,6 @@ def chunk_text(text, doc_name, page_num, chunk_size=1200):
     text = normalize_whitespace(text)
     sentences = re.split(r'(?<=[.!?])\s+', text)
 
-    doc_type = classify_document(text)
     chunks = []
     current = ""
 
@@ -118,8 +97,7 @@ def chunk_text(text, doc_name, page_num, chunk_size=1200):
                 doc_name,
                 page_num,
                 chunk_id,
-                current.strip(),
-                doc_type
+                current.strip()
             ))
             current = sent
 
@@ -130,28 +108,10 @@ def chunk_text(text, doc_name, page_num, chunk_size=1200):
             doc_name,
             page_num,
             chunk_id,
-            current.strip(),
-            doc_type
+            current.strip()
         ))
 
     return chunks
-
-# =========================
-# CLEAN CONTEXT (IMPORTANT)
-# =========================
-def clean_context(text):
-    lines = text.split("\n")
-    cleaned = []
-
-    for line in lines:
-        line = line.strip()
-        if len(line) < 3:
-            continue
-        if "print(" in line or "=" in line:
-            continue
-        cleaned.append(line)
-
-    return " ".join(cleaned)
 
 # =========================
 # FAISS
@@ -190,21 +150,27 @@ def search(embed_model, rerank_model, index, chunks, query, top_k):
     return sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_k]
 
 # =========================
-# STREAMING + CLEAN OUTPUT
+# STREAMING ANSWER (FIXED)
 # =========================
 def synthesize_answer_stream(results, query, tokenizer, model):
     if not results:
         yield "Information not found."
         return
 
-    context = "\n\n".join([clean_context(r["text"]) for r in results[:2]])
+    context = "\n\n".join([r["text"] for r in results[:2]])
 
     prompt = f"""
-Summarize in 3-5 bullet points:
+Use ONLY the information from the context.
 
+If answer is not present, say "Not found in document".
+
+Context:
 {context}
 
-Answer:
+Question:
+{query}
+
+Answer in short bullet points:
 """
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
@@ -215,32 +181,15 @@ Answer:
         **inputs,
         streamer=streamer,
         max_new_tokens=150,
-        temperature=0.2,
+        temperature=0.1,
+        do_sample=False
     )
 
     thread = Thread(target=model.generate, kwargs=generation_kwargs)
     thread.start()
 
-    buffer = ""
     for token in streamer:
-        buffer += token
-
-    # CLEAN OUTPUT
-    lines = buffer.split("\n")
-    final_lines = []
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        if "Context" in line or "Question" in line:
-            continue
-        if not line.startswith("-"):
-            line = "- " + line
-        final_lines.append(line)
-
-    final = "\n".join(final_lines)
-    yield final
+        yield token
 
 # =========================
 # BUILD DATASET
@@ -301,9 +250,11 @@ def main():
             )
 
             placeholder = st.empty()
+            full_text = ""
 
-            for output in synthesize_answer_stream(results, query, tokenizer, model):
-                placeholder.markdown(output)
+            for token in synthesize_answer_stream(results, query, tokenizer, model):
+                full_text += token
+                placeholder.markdown(full_text)
 
 if __name__ == "__main__":
     main()
